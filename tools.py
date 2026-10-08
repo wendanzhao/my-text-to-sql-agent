@@ -18,26 +18,26 @@ MAX_ROWS = 100
 TRUNCATED_MESSAGE = (f"(The results have been truncated after {MAX_ROWS} rows, " 
                      "it is not the total number of rows, you can use COUNT or SUM to get the total.)")
 
-
+PROBE_LIMIT = 50
 
 def list_tables() -> str:
+    return ", ".join(get_table_names())
+      
+def get_table_names() -> list[str]:
     with closing(get_conn()) as conn:
         rows = conn.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'"
                         ).fetchall()
-        return ", ".join([row[0] for row in rows])
-
+        return [row[0] for row in rows]
 
 def get_schema(table: str) -> str:
-    ddl = None
+    table = validate_table(table)
+
     with closing(get_conn()) as conn:
         ddl = conn.execute(
                         "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
                         (table,)).fetchone()
-    if ddl is None:
-        raise ValueError(f"Table '{table}' does not exist. Available tables: {list_tables()}")
-    
-    return ddl[0]
+        return ddl[0]
 
 def run_sql(query: str) -> str:
     with closing(get_conn()) as conn:
@@ -58,8 +58,47 @@ def run_sql(query: str) -> str:
             if str(e) == "interrupted":
                 raise TimeoutError(QUERY_TIMEOUT_MESSAGE) from e
             raise 
-        
-        
+
+def get_distinct_values(table: str, column: str) -> str:
+    real_table = validate_table(table)
+
+    with closing(get_conn()) as conn:
+        rows = conn.execute(f"PRAGMA table_info(\"{real_table}\")").fetchall()
+        column_names = {row[1].lower() : row[1] for row in rows}
+        if column.lower() not in column_names:
+            raise ValueError(f"Column '{column}' does not exist in table '{real_table}'. Available columns: {', '.join(column_names.values())}")
+
+        real_column = column_names[column.lower()]
+        distinct_values = conn.execute(
+            f'SELECT DISTINCT "{real_column}" FROM "{real_table}" LIMIT {PROBE_LIMIT}'
+        ).fetchall()
+        total_count = conn.execute(
+            f'SELECT COUNT(DISTINCT "{real_column}") FROM "{real_table}"'
+        ).fetchone()[0]
+
+        truncated = total_count > PROBE_LIMIT
+        values_str = ", ".join(_format_value(row[0]) for row in distinct_values)
+        if truncated:
+            values_str += f" (showing {PROBE_LIMIT} of {total_count} distinct values)"
+        return values_str
+
+def _format_value(value) -> str:  
+    if value is None:
+        return "NULL"
+    if isinstance(value, str):
+        value = value.replace("'", "''")
+        return f"'{value}'"
+    return str(value)
+
+# 不区分大小写，验证表名是否存在于数据库中，并返回真实的表名
+def validate_table(table: str) -> str:
+    table_names = get_table_names()
+    tables = {t.lower() : t for t in table_names}
+    if table.lower() not in tables:
+        raise ValueError(f"Table '{table}' does not exist. Available tables: {', '.join(tables.values())}")
+    return tables[table.lower()]
+    
+
 # 执行工具的函数，返回 (result, is_error)
 def execute_tool(name: str, tool_input: dict) -> tuple[str, bool]:
     func = TOOL_FUNCS.get(name)
@@ -89,7 +128,7 @@ def get_conn() -> sqlite3.Connection:
 
 
 # 给模型看的说明书（JSON schema), 告诉它有哪些工具、参数长什么样
-TOOLS = [
+BASE_TOOLS = [
     {
         "name": "get_schema",
         "description": "Return the CREATE TABLE statement for a given table.",
@@ -123,26 +162,32 @@ TOOLS = [
     }
 ]
 
+PROBE_TOOL= {
+    "name": "get_distinct_values",
+    "description": ("Return the distinct values actually stored in a column "
+                    f"(up to {PROBE_LIMIT}, with the total count if truncated). "
+                    "Call this before filtering with a string literal in a WHERE clause "
+                    "when you are not sure of the exact spelling or casing used in the database "
+                    "(e.g. 'USA' vs 'United States'). "
+                    "A wrong value does not cause an error; it silently returns zero rows."),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "table": {"type": "string", "description": "Table name"},
+            "column": {"type": "string", "description": "Column name"}
+        },
+        "required": ["table", "column"],
+    }
+}
+
 # 给代码看的查找表，工具名到函数的映射
 TOOL_FUNCS = {
     "list_tables": list_tables,
     "get_schema": get_schema,
     "run_sql": run_sql,
+    "get_distinct_values": get_distinct_values,
 }
 
 
 if __name__ == "__main__":
-    # tests = [
-    #     "SELECT * FROM Artist LIMIT 3",
-    #     "SELEC * FROM Artist",
-    #     "DELETE FROM Artist WHERE ArtistId = 1",
-    #     "SELECT COUNT(*) FROM Track a, Track b, Track c",
-    # ]
-    # for q in tests:
-    #     result, is_error = execute_tool("run_sql", {"query": q})
-    #     print(f"is_error={is_error} | {q}\n  -> {result[:200]}\n")
-    result = run_sql("SELECT * FROM Track")
-    print(len(result))        # 应该从 299889 降到一万左右
-    print(result[-150:])      # 最后一行应该是截断提示，中间没有一长串空格
-
-    print(run_sql("SELECT * FROM Artist LIMIT 5"))  # 最后一行还是 (5 rows)
+    print(_format_value("O'Brien"))   

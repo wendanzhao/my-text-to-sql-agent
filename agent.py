@@ -1,14 +1,22 @@
+from dataclasses import dataclass
 import time
-
 import anthropic
-from tools import TOOLS, TOOL_FUNCS, execute_tool
+from config import AgentConfig
+from tools import BASE_TOOLS, PROBE_TOOL, TOOL_FUNCS, execute_tool
+from enum import StrEnum
 
-MAX_TURNS = 5
+import logging
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+
 MODEL = "claude-haiku-4-5-20251001"
 
-MAX_RETRIES = 3
+API_MAX_RETRIES = 3
 TIME_OUTS = 30  #seconds 后面需要进行测量调整！
-client = anthropic.Anthropic(max_retries=MAX_RETRIES, timeout=TIME_OUTS)
+client = anthropic.Anthropic(max_retries=API_MAX_RETRIES, timeout=TIME_OUTS)
 
 
 SYSTEM_PROMPT = "You are a sqlite3 database analytical assistant. " \
@@ -16,26 +24,54 @@ SYSTEM_PROMPT = "You are a sqlite3 database analytical assistant. " \
                 "Start by exploring the database schema using tools provided, " \
                 "and then create SQL query and execute it to get the results."
 
-def ask(question: str) -> str:
+class Status(StrEnum):
+    OK = "ok"
+    API_ERROR = "api_error"
+    UNEXPECTED_STOP = "unexpected_stop"
+    EMPTY_RESPONSE = "empty_response"
+    MAX_TOKENS_REACHED = "max_tokens_reached"
+    SELF_CORRECTION_OFF = "self_correction_off"
+    RETRIES_EXHAUSTED = "retries_exhausted"
+    MAX_TURNS_REACHED = "max_turns_reached"
+
+@dataclass
+class AgentResult:
+    answer: str         # 给用户看的
+    status: Status      # 给程序看的：
+    sql_error_count: int  # 给开发者看的
+
+
+def ask(question: str, config: AgentConfig | None = None) -> AgentResult:
+    config = config or AgentConfig()
+    logger.info(f"{config}")
+
     messages = [{"role": "user", "content": question}]
 
     in_tokens = out_tokens = turns = 0
     start_time = time.perf_counter()
+    tools = BASE_TOOLS + ([PROBE_TOOL] if config.enable_value_probe else [])   
+
+    sql_error_count = 0
+
     try:
-        for turn in range(MAX_TURNS):
+        for turn in range(config.max_turns):
             turn_start_time = time.perf_counter()
             try:
                 resp = client.messages.create(
                     model=MODEL,
                     max_tokens=1024,
                     system=SYSTEM_PROMPT,
-                    tools=TOOLS,
+                    tools=tools,
                     messages=messages,
                 )
                 turn_end_time = time.perf_counter()
             except anthropic.APIError as e:
-                print(f"[turn {turn}] Error type: {type(e).__name__}, Error message: {e}")
-                return f"Failed to get a response due to an API error: Error type: {type(e).__name__}, Error message: {e}"
+                logger.error(f"[turn {turn}] Error type: {type(e).__name__}, Error message: {e}")
+                return AgentResult(
+                            answer=f"Failed to get a response due to an API error",
+                            status=Status.API_ERROR,
+                            sql_error_count=sql_error_count,
+                        )
 
         
             messages.append({"role": "assistant", "content": resp.content})
@@ -48,12 +84,35 @@ def ask(question: str) -> str:
                 f"in={resp.usage.input_tokens} out={resp.usage.output_tokens} | " 
                 f"used {turn_end_time - turn_start_time:.2f}s")
 
-            if resp.stop_reason != "tool_use":
+            if resp.stop_reason == "end_turn":
                 for block in resp.content:
                     if block.type == "text":
-                        return block.text
-                return f"can't obtain a valid response. stop_reason = {resp.stop_reason}"
-
+                        return AgentResult(
+                            answer=block.text,
+                            status=Status.OK,
+                            sql_error_count=sql_error_count,
+                        )
+                logger.warning(
+    f"end_turn without text block, content types: {[b.type for b in resp.content]}"
+)
+                return AgentResult(
+                            answer="Sorry, no answer was returned, Please try again.",
+                            status=Status.EMPTY_RESPONSE,
+                            sql_error_count=sql_error_count,
+                        )
+            elif resp.stop_reason == "max_tokens":
+                return AgentResult(
+                    answer="Failed to get a response due to max tokens reached.",
+                    status=Status.MAX_TOKENS_REACHED,
+                    sql_error_count=sql_error_count,
+                )
+            elif resp.stop_reason != "tool_use":
+                logger.warning(f"Unexpected stop_reason: {resp.stop_reason}")
+                return AgentResult(
+                            answer=f"Unexpected stop_reason",
+                            status=Status.UNEXPECTED_STOP,
+                            sql_error_count=sql_error_count,
+                        )
 
             tool_results = []
             for block in resp.content:
@@ -61,6 +120,26 @@ def ask(question: str) -> str:
                     result, is_error = execute_tool(block.name, block.input)
                     # 看看模型是怎么一步步探索数据库的
                     print(f"[turn {turn}] is_error = {is_error} | {block.name}({block.input}) -> {result[:300]}")
+
+                    if block.name == "run_sql" and is_error:
+                        sql_error_count += 1
+                        logger.warning(f"SQL error #{sql_error_count}: {result}")
+
+                        if not config.enable_self_correction:
+                            # 关： 第一次出错就停，模型没有机会改
+                            return AgentResult(
+                                answer="Sorry, Can't answer due to SQL error.",
+                                status=Status.SELF_CORRECTION_OFF,
+                                sql_error_count=sql_error_count,
+                            )
+                        if sql_error_count > config.max_sql_retries:
+                            # 开，但重试次数用完了
+                            return AgentResult(
+                                answer="Sorry, Can't answer due to SQL errors and max retries reached.",
+                                status=Status.RETRIES_EXHAUSTED,
+                                sql_error_count=sql_error_count,
+                            )
+                        
 
                     tool_results.append({
                             "type": "tool_result",
@@ -71,29 +150,26 @@ def ask(question: str) -> str:
 
             messages.append({"role": "user","content": tool_results})
         
-        return "Can't finish after max turns"
+        return AgentResult(
+            answer="Sorry, Can't finish query after max turns.",
+            status=Status.MAX_TURNS_REACHED,
+            sql_error_count=sql_error_count,
+        )
     finally:
         print(f"[total] {turns} turns | in={in_tokens} out={out_tokens} | used {time.perf_counter() - start_time:.2f}s")
 
 
 
+from dataclasses import replace
 
-if __name__ == "__main__":
-    print(ask("list all the songs' names?"))
-    # print(execute_tool("get_schema", {"table": "NotATable"}))   # 表不存在
-    # print(execute_tool("run_sql", {"query": "SELEC *"}))        # SQL 错误
-    # print(execute_tool("no_such_tool", {}))                     # 工具不存在
-    # print(execute_tool("list_tables", {}))                      # 正常情况
-    # result, is_error = execute_tool("list_tables", {})
-    # assert is_error is False, "正常调用不应该标记为出错"
-
-    # result, is_error = execute_tool("run_sql", {"query": "SELEC *"})
-    # assert is_error is True, "SQL 错误应该标记为出错"
-
-    # result, is_error = execute_tool("get_schema", {"table": "NotATable"})
-    # assert is_error is True, "表不存在应该标记为出错"
-
-    # result, is_error = execute_tool("no_such_tool", {})
-    # assert is_error is True, "工具不存在应该标记为出错"
-    # print("all tests passed")
-
+if __name__ == "__main__":  
+    question = "How many hip hop tracks are there?"
+    base = AgentConfig()
+    configs = {
+        "probe_on": base,
+        "probe_off": replace(base, enable_value_probe=False),
+    }
+    for name, cfg in configs.items():
+        for i in range(3):
+            r = ask(question, cfg)
+            print(f"### {name} run{i}: status={r.status} errors={r.sql_error_count}")
